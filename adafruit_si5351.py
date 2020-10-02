@@ -44,7 +44,7 @@ __repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_SI5351.git"
 # Internal constants:
 _SI5351_ADDRESS = const(0x60)  # Assumes ADDR pin = low
 _SI5351_READBIT = const(0x01)
-_SI5351_CRYSTAL_FREQUENCY = 25000000.0  # Fixed 25mhz crystal on board.
+_SI5351_CRYSTAL_FREQUENCY = 25000000  # Fixed 25mhz crystal on board.
 _SI5351_REGISTER_0_DEVICE_STATUS = const(0)
 _SI5351_REGISTER_1_INTERRUPT_STATUS_STICKY = const(1)
 _SI5351_REGISTER_2_INTERRUPT_STATUS_MASK = const(2)
@@ -147,13 +147,19 @@ R_DIV_128 = 7
 # and return statements.  Disable.
 # pylint: disable=too-many-return-statements
 
+
 def _gcd(a, b):
     while b:
         a, b = b, a % b
     return a
 
+def _reduce(a, b):
+    g = _gcd(a, b)
+    return a // g, b // g
+
 # Adapted from Python 3.8 fractions.py
-def _limit_denominator(n, d, max_denominator=0xfffff):
+# pylint: disable=too-many-locals
+def _limit_denominator(n, d, max_denominator=0xFFFFF):
     """Approximate a fraction most accurately without exceeding a given denominator"""
 
     # Algorithm notes: For any real number x, define a *best upper
@@ -181,9 +187,7 @@ def _limit_denominator(n, d, max_denominator=0xfffff):
         raise ValueError("max_denominator should be at least 1")
 
     # The algorithm assumes n, d are already reduced (gcd(n, d) == 1)
-    g = _gcd(n, d)
-    n //= g
-    d //= g
+    n, d = _reduce(n, d)
 
     if d <= max_denominator:
         return n, d
@@ -191,24 +195,28 @@ def _limit_denominator(n, d, max_denominator=0xfffff):
     n0, d0 = n, d
     p0, q0, p1, q1 = 0, 1, 1, 0
     while True:
-        a = n//d
-        q2 = q0+a*q1
+        a = n // d
+        q2 = q0 + a * q1
         if q2 > max_denominator:
             break
-        p0, q0, p1, q1 = p1, q1, p0+a*p1, q2
-        n, d = d, n-a*d
+        p0, q0, p1, q1 = p1, q1, p0 + a * p1, q2
+        n, d = d, n - a * d
 
-    k = (max_denominator-q0)//q1
-    n1, d1 = (p0+k*p1, q0+k*q1)  # bound1
-    n2, d2 = (p1, q1)            # bound2
-    nn1 = abs(n1 * d0 - n0 * d1) * d2
-    nn2 = abs(n2 * d0 - n0 * d2) * d1
+    k = (max_denominator - q0) // q1
+    n1, d1 = (p0 + k * p1, q0 + k * q1)  # bound1
+    n2, d2 = (p1, q1)  # bound2
+    try:
+        nn1 = abs(n1 * d0 - n0 * d1) * d2
+    except OverflowError:
+        nn1 = abs(1. * n1 * d0 - 1. * n0 * d1) * d2
+    try:
+        nn2 = abs(n2 * d0 - n0 * d2) * d1
+    except OverflowError:
+        nn2 = abs(1. * n2 * d0 - 1. * n0 * d2) * d1
     if nn2 <= nn1:
         return n2, d2
-    else:
-        return n1, d1
-
-
+    return n1, d1
+# pylint: enable=too-many-locals
 
 class SI5351:
     """SI5351 clock generator.  Initialize this class by specifying:
@@ -229,6 +237,14 @@ class SI5351:
             self._denominator = None
             self.clock_control_enabled = clock_control_enabled
 
+        def reset(self):
+            """Reset this PLL.  This causes dependent clocks to have their phases reset"""
+            if self.base_address == 34:
+                bit = 7
+            else:
+                bit = 5
+            self._si5351._write_u8(_SI5351_REGISTER_177_PLL_RESET, 1 << bit)
+
         @property
         def frequency(self):
             """Get the frequency of the PLL in hertz."""
@@ -237,11 +253,15 @@ class SI5351:
             return self._numerator * (self._si5351.frequency / self._denominator)
 
         @property
-        def frequency_ratio(self):
-            """Get the frequency of the PLL in hertz as a ratio of two numbers"""
+        def ratio(self):
+            """Get the multiplier ratio of the PLL
+
+            The actual PLL output frequency is the input frequency times the
+            ratio
+            """
             if self._numerator is None:
                 return None
-            return self._numerator * self._si5351.frequency, self._denominator
+            return self._numerator, self._denominator
 
         def _configure_registers(self, p1, p2, p3):
             # Update PLL registers.
@@ -260,10 +280,21 @@ class SI5351:
             self._si5351._write_u8(_SI5351_REGISTER_177_PLL_RESET, (1 << 7) | (1 << 5))
 
         def configure_frequency(self, frequency, frequency_denominator=1):
-            frequency = round(frequency)
+            """Configure the PLL for the given frequency (or as close as
+            possible), selecting an integer or fractional setting as necessary.
+
+            If only frequency is specified, it is an integer frequency.  If
+            frequency_denominator is specified, then the frequency is the ratio
+            (frequency/frequency_denominator).
+
+            According to the datasheet, frequencies from 600MHz to 900MHz are permitted.
+
+            For devices without long integers, frequency_denominator>1 will lead
+            to overflow and are not usable.
+            """
             n, d = _limit_denominator(
-                frequency,
-                frequency_denominator * self._si5351.frequency)
+                frequency, frequency_denominator * self._si5351.frequency
+            )
             if n % d == 0:
                 self.configure_integer(n // d)
             else:
@@ -273,12 +304,12 @@ class SI5351:
             """Configure the PLL with a simple integer mulitplier for the most
             accurate (but more limited) PLL frequency generation.
             """
-            if not (14 < multiplier < 91):
+            if not 14 < multiplier < 91:
                 raise ValueError("Multiplier out of range")
             multiplier = int(multiplier)
             # Compute register values and configure them.
             p1 = 128 * multiplier - 512
-            assert 0 <= p1 <= 0x3ffff
+            assert 0 <= p1 <= 0x3FFFF
             p2 = 0
             p3 = 1
             self._configure_registers(p1, p2, p3)
@@ -290,11 +321,11 @@ class SI5351:
             multiplier and numerator/denominator.  This is less accurate and
             susceptible to jitter but allows a larger range of PLL frequencies.
             """
-            if not (14 < multiplier < 91):
+            if not 14 < multiplier < 91:
                 raise ValueError("Multiplier out of range")
-            if not (0 < denominator <= 0xFFFFF):
+            if not 0 < denominator <= 0xFFFFF:
                 raise ValueError("Denominator out of range")
-            if not (0 <= numerator < 0xFFFFF):
+            if not 0 <= numerator < 0xFFFFF:
                 raise ValueError("Numerator out of range")
             multiplier = int(multiplier)
             numerator = int(numerator)
@@ -361,16 +392,15 @@ class SI5351:
                 raise RuntimeError("Unexpected R divider!")
 
         @property
-        def frequency_ratio(self):
-            """Get the frequency of this clock output in hertz as the ratio of
-            two integers.  This is computed based on the configured PLL, clock
-            divider, and R divider.
+        def ratio(self):
+            """Get the ratio of this output clock, including the R divider
             """
             # Make sure a PLL and divider are present, i.e. this clock has
             # been configured, otherwise return nothing.
             if self._pll is None or self._numerator is None:
                 return None
-            return self._denominator, self._numerator * (1 << self.r_divider)
+            n, d = self._numerator * (1 << self.r_divider), self._denominator
+            return n, d
 
         @property
         def r_divider(self):
@@ -411,10 +441,24 @@ class SI5351:
             self._si5351._write_u8(self._base + 7, (p2 & 0x000000FF))
 
         def configure_frequency_r(self, pll, frequency, frequency_denominator=1):
-            frequency = round(frequency)
+            """Configure the PLL for the given frequency (or as close as
+            possible), selecting an integer or fractional setting as necessary.
+
+            If only frequency is specified, it is an integer frequency.  If
+            frequency_denominator is specified, then the frequency is the ratio
+            (frequency/frequency_denominator).
+
+            For devices without long integers, frequency_denominator>1 may lead
+            to overflow if it is not also a factor of the PLL frequency.
+            """
+            np, dp = pll.ratio
+            f0 = self._si5351.frequency
+            dp, f0 = _reduce(dp, f0)
+            frequency, np = _reduce(frequency, np)
+            np *= f0
+            dp, frequency_denominator = _reduce(dp, frequency_denominator)
 
             for r in range(8):
-                np, dp = pll.frequency_ratio
                 n, d = _limit_denominator(dp * frequency, np * frequency_denominator)
                 try:
                     if n % d == 0:
@@ -433,7 +477,7 @@ class SI5351:
             divider.  This is the most accurate way to set the clock output
             frequency but supports less of a range of values.
             """
-            if not (3 < divider < 901):
+            if not 3 < divider < 901:
                 raise ValueError("Divider out of range")
 
             divider = int(divider)
@@ -441,7 +485,7 @@ class SI5351:
             assert pll.frequency is not None
             # Compute MSx register values.
             p1 = 128 * divider - 512
-            assert 0 <= p1 <= 0x3ffff
+            assert 0 <= p1 <= 0x3FFFF
             p2 = 0
             p3 = 1
             self._configure_registers(p1, p2, p3)
@@ -462,11 +506,11 @@ class SI5351:
             fractional divider with numerator/denominator.  Again this is less
             accurate but has a wider range of output frequencies.
             """
-            if not (3 < divider < 901):
+            if not 3 < divider < 901:
                 raise ValueError("Divider out of range")
-            if not (0 < denominator <= 0xFFFFF):
+            if not 0 < denominator <= 0xFFFFF:
                 raise ValueError("Denominator out of range")
-            if not (0 <= numerator < 0xFFFFF):
+            if not 0 <= numerator < 0xFFFFF:
                 raise ValueError("Numerator out of range")
             divider = int(divider)
             numerator = int(numerator)
@@ -475,7 +519,7 @@ class SI5351:
             assert pll.frequency is not None
             # Compute MSx register values.
             p1 = int(128 * divider + math.floor(128 * (numerator / denominator)) - 512)
-            assert 0 <= p1 <= 0x3ffff
+            assert 0 <= p1 <= 0x3FFFF
             p2 = int(
                 128 * numerator
                 - denominator * math.floor(128 * (numerator / denominator))
@@ -496,7 +540,9 @@ class SI5351:
     # This is not thread-safe or re-entrant by design!
     _BUFFER = bytearray(2)
 
-    def __init__(self, i2c, *, address=_SI5351_ADDRESS, frequency=_SI5351_CRYSTAL_FREQUENCY):
+    def __init__(
+        self, i2c, *, address=_SI5351_ADDRESS, frequency=_SI5351_CRYSTAL_FREQUENCY
+    ):
         self.frequency = frequency
         self._device = i2c_device.I2CDevice(i2c, address)
         # Setup the SI5351.
